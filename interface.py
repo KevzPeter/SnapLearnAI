@@ -15,10 +15,17 @@ from typing import List, Dict
 import json
 from streamlit_player import st_player
 import requests
+import pyttsx3
 
 load_dotenv()
 
 os.environ["GOOGLE_API_KEY"] = os.getenv("GOOGLE_API_KEY")
+
+engine = pyttsx3.init()
+
+def speak_text(text):
+    engine.say(text)
+    engine.runAndWait()
 
 def get_available_models():
     try:
@@ -187,46 +194,63 @@ def get_response(query, model=None):
     
     return response
 
-def analyze_transcript_segments(transcript, url, model=None):
-    model = model or st.session_state.selected_model
+def analyze_transcript_segments(transcript, url):
     llm = ChatOpenAI(
         base_url="http://127.0.0.1:1234/v1",
         model_name="llama-3.2-3b-instruct",
         api_key="lm-studio"
     )
-    
-    # Group transcript entries into meaningful segments
+ 
+    # Divide transcript into 5 equal parts by duration
+    total_duration = transcript[-1]['start'] + transcript[-1].get('duration', 0)
+    segment_duration = total_duration / 5
     segments = []
-    current_segment = {"text": "", "start": 0, "end": 0}
-    
+    current_segment = []
+ 
+    # Group entries by time segments
     for entry in transcript:
-        if len(current_segment["text"]) < 500:  # Group into ~500 char segments
-            if not current_segment["text"]:
-                current_segment["start"] = entry["start"]
-            current_segment["text"] += " " + entry["text"]
-            current_segment["end"] = entry["start"] + entry["duration"]
+        if entry['start'] <= (len(segments) + 1) * segment_duration:
+            current_segment.append(entry)
         else:
-            segments.append(current_segment)
-            current_segment = {"text": entry["text"], "start": entry["start"], "end": entry["start"] + entry["duration"]}
-    
-    if current_segment["text"]:
+            if current_segment:
+                segments.append(current_segment)
+                current_segment = [entry]
+    if current_segment:
         segments.append(current_segment)
-    
-    # Analyze segments for importance
+ 
+    # Enhanced prompt for concise, heading-style topics
     prompt = ChatPromptTemplate.from_messages([
-        ("system", "You are an expert at identifying key moments in video transcripts. Return 'important' only if the segment contains crucial information, main points, or topic transitions."),
-        ("human", "Analyze this transcript segment and respond with 'important' or 'not important':\n{segment}")
+        ("system", """You are an expert at creating clear, concise section headings for video content.
+        For each segment, return a brief (2-5 words) topic heading that captures the main concept.
+        Use proper title case and professional terminology.
+        Examples:
+        - "Introduction and Overview"
+        - "Key Methodology Steps"
+        - "Performance Evaluation"
+        - "Implementation Results"
+        - "Future Research Directions"
+        """),
+        ("human", "Create a concise section heading for this content:\n{text}")
     ])
-    
+ 
     chain = prompt | llm | StrOutputParser()
-    
-    important_segments = []
+ 
+    # Process each segment to identify main topics
+    main_topics = []
     for segment in segments:
-        importance = chain.invoke({"segment": segment["text"]})
-        if "important" in importance.lower():
-            important_segments.append(segment)
-    
-    return important_segments
+        if len(main_topics) < 5:
+            segment_text = ' '.join(entry['text'] for entry in segment[:10])
+            try:
+                topic = chain.invoke({"text": segment_text}).strip()
+                main_topics.append({
+                    "topic": topic,
+                    "start": segment[0]['start'],
+                    "text": segment[0]['text']  # Keep original text for context
+                })
+            except Exception:
+                continue
+ 
+    return main_topics
 
 def main():
     st.set_page_config(page_title="SnapLearnAI", page_icon="📚")
@@ -273,11 +297,11 @@ def main():
 
         with tab2:
             youtube_url = st.text_input("Enter YouTube URL")
-            
+ 
             if youtube_url:
                 # Display video player
-                st_player(youtube_url)
-                
+                player = st_player(youtube_url)
+ 
                 if st.button("Process YouTube Video"):
                     try:
                         with st.spinner("Processing YouTube transcript..."):
@@ -285,24 +309,50 @@ def main():
                             transcript = YouTubeTranscriptApi.get_transcript(video_id)
                             transcript_text = ' '.join([entry['text'] for entry in transcript])
                             st.session_state.vector_store = create_vector_store(transcript_text)
-                            
-                            # Analyze and display important segments
-                            important_segments = analyze_transcript_segments(transcript, youtube_url)
-                            
-                            with st.sidebar:
-                                st.subheader("Key Moments")
-                                for segment in important_segments:
-                                    start_time = int(segment["start"])
-                                    timestamp_url = f"{youtube_url}&t={start_time}s"
-                                    with st.expander(f"{int(start_time//60)}:{int(start_time%60):02d}"):
-                                        st.write(segment["text"])
-                                        st.markdown(f"[Jump to timestamp]({timestamp_url})")
-                            
+ 
+                            # Store important segments in session state
+                            st.session_state.important_segments = analyze_transcript_segments(transcript, youtube_url)
                             st.success("Successfully processed YouTube video")
                     except Exception as e:
                         st.error(f"Error processing YouTube video: {str(e)}")
-            else:
-                st.error("Please enter a YouTube URL")
+ 
+                # Display segments from session state
+                # Display segments from session state
+                if hasattr(st.session_state, 'important_segments'):
+                    with st.sidebar:
+                        st.subheader("Key Moments")
+                        for segment in st.session_state.important_segments:
+                            start_time = int(segment["start"])
+ 
+                            # Clean up the topic text by removing all explanatory text
+                            topic = segment['topic']
+                            timestamped_url = f"{youtube_url}&t={start_time}s"
+ 
+                            # Remove common explanatory phrases
+                            cleanup_phrases = [
+                                "Here is a concise section heading:",
+                                "Here is a possible section heading:",
+                                "This heading captures",
+                                "Both of these headings capture",
+                                "or alternatively,",
+                                "(or alternatively,"
+                            ]
+ 
+                            for phrase in cleanup_phrases:
+                                if phrase.lower() in topic.lower():
+                                    topic = topic.split(phrase)[-1]
+ 
+                            # Remove quotes and clean up extra whitespace
+                            topic = topic.strip('"').strip()
+ 
+                            # Remove any text after a period (explanatory text often follows)
+                            if "." in topic:
+                                topic = topic.split(".")[0]
+ 
+                            # Display only timestamp and cleaned topic
+                            with st.expander(f"{int(start_time//60)}:{int(start_time%60):02d} - {topic}"):
+                                if st.button("Jump to timestamp", key=f"ts_{start_time}"):
+                                    st_player(timestamped_url)
         
         
 
@@ -339,7 +389,14 @@ def main():
                     # Replace placeholder with actual response
                     message_placeholder.markdown(response)
                 st.session_state.chat_history.append({"role": "assistant", "content": response})
-        
+        if st.button("🔊"):
+        # Ensure there is a response to speak
+            if st.session_state.chat_history and st.session_state.chat_history[-1]["role"] == "assistant":
+                last_response = st.session_state.chat_history[-1]["content"]
+                speak_text(last_response)
+            else:
+                st.warning("No assistant response to speak!")
+
     with tab2:
         if st.session_state.vector_store is None:
             st.warning("Please load a document or YouTube video first to generate a quiz.")
