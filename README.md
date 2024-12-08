@@ -1,1 +1,1 @@
-NYU Hackathon
+# 📚 SnapLearn AI - AI Assistant
